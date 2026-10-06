@@ -2,6 +2,8 @@
 
 Windows 10/11 下运行的 Rust + Tauri 进程性能管理工具。按进程名自动设置 CPU 亲和性和进程优先级，支持多个实例、后台监控、系统托盘和 TOML 配置。
 
+Go + Wails 重构版本位于 [`golang/`](golang/README.md)，使用 Node.js 和 pnpm 构建前端，兼容现有配置与最近 100 条日志。
+
 ## 构建环境
 
 - Windows 10/11 x64
@@ -51,7 +53,7 @@ Release exe 会嵌入 Windows `requireAdministrator` manifest，启动时自动�
 %APPDATA%\ProcessAffinityManager\logs\app.log
 ```
 
-日志最多保留最近 1000 条内存记录，文件日志持续追加。
+运行日志和日志文件均只保留最近 100 条记录，超出上限时移除最早的记录。
 
 ## CPU 亲和性
 

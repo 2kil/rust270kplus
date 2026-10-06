@@ -12,8 +12,11 @@ mod startup;
 use config::Config;
 use monitor::{Command, Event, RuleSnapshot};
 use serde::Serialize;
-use std::{fs::OpenOptions, io::Write, sync::{mpsc, Mutex}};
+use std::{path::Path, sync::{mpsc, Mutex}};
 use tauri::{Emitter, Manager, State, WindowEvent};
+
+const LOG_LIMIT: usize = 100;
+static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct AppState {
     config: Mutex<Config>,
@@ -28,6 +31,7 @@ pub struct RuntimeStatus {
     pub logical_cpus: usize,
     pub processor_group_supported: bool,
     pub permission_denied: bool,
+    pub config_error: Option<String>,
 }
 
 #[tauri::command]
@@ -40,6 +44,11 @@ fn save_config(config: Config, state: State<'_, AppState>) -> Result<(), String>
     if !errors.is_empty() { return Err(errors.join("\n")); }
     config::save(&config).map_err(|e| e.to_string())?;
     *state.config.lock().map_err(|e| e.to_string())? = config.clone();
+    {
+        let mut runtime = state.runtime.lock().map_err(|e| e.to_string())?;
+        runtime.enabled = config.general.enabled;
+        runtime.config_error = None;
+    }
     state.monitor_tx.lock().map_err(|e| e.to_string())?.send(Command::SetConfig(config)).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -51,10 +60,10 @@ fn list_running_processes() -> Vec<process::ProcessInfo> { process::list_process
 fn get_rule_snapshots(state: State<'_, AppState>) -> Result<Vec<RuleSnapshot>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?.clone();
     let processes = process::list_processes();
-    Ok(config.processes.iter().filter(|rule| rule.enabled).map(|rule| {
+    Ok(config.processes.iter().enumerate().filter(|(_, rule)| rule.enabled).map(|(index, rule)| {
         let matches = process::matching_from(&processes, rule);
         let pids = matches.iter().map(|item| item.pid).collect::<Vec<_>>();
-        RuleSnapshot { name: rule.name.clone(), running: !pids.is_empty(), pids }
+        RuleSnapshot { index, name: rule.name.clone(), running: !pids.is_empty(), pids }
     }).collect())
 }
 
@@ -75,9 +84,12 @@ fn set_monitor_paused(paused: bool, state: State<'_, AppState>) -> Result<(), St
 #[tauri::command]
 fn set_start_with_windows(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
     startup::set_enabled(enabled)?;
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    config.general.start_with_windows = enabled;
-    config::save(&config).map_err(|e| e.to_string())
+    let mut next = state.config.lock().map_err(|e| e.to_string())?.clone();
+    next.general.start_with_windows = enabled;
+    config::save(&next).map_err(|e| e.to_string())?;
+    state.runtime.lock().map_err(|e| e.to_string())?.config_error = None;
+    *state.config.lock().map_err(|e| e.to_string())? = next;
+    Ok(())
 }
 
 #[tauri::command]
@@ -85,20 +97,23 @@ fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus, Strin
 
 #[tauri::command]
 fn get_logs() -> Vec<String> {
+    let Ok(_guard) = LOG_LOCK.lock() else { return Vec::new(); };
     std::fs::read_to_string(config::log_path())
-        .map(|text| text.lines().map(|line| if has_timestamp(line) { line.to_owned() } else { timestamp_line(line) }).collect::<Vec<_>>())
+        .map(|text| recent_logs(&text))
         .unwrap_or_default()
-        .into_iter()
-        .rev()
-        .take(1000)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+}
+
+fn recent_logs(text: &str) -> Vec<String> {
+    let mut lines = text.lines().rev().take(LOG_LIMIT)
+        .map(|line| if has_timestamp(line) { line.to_owned() } else { timestamp_line(line) })
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines
 }
 
 #[tauri::command]
 fn clear_logs() -> Result<(), String> {
+    let _guard = LOG_LOCK.lock().map_err(|error| error.to_string())?;
     let path = config::log_path();
     if path.exists() { std::fs::write(path, "").map_err(|error| error.to_string())?; }
     Ok(())
@@ -136,9 +151,21 @@ fn delete_process_rule(index: usize, state: State<'_, AppState>) -> Result<(), S
 }
 
 fn append_log(message: &str) {
-    let path = config::log_path();
-    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) { let _ = writeln!(file, "{}", timestamp_line(message)); }
+    let Ok(_guard) = LOG_LOCK.lock() else { return; };
+    let _ = write_log(&config::log_path(), message);
+}
+
+fn write_log(path: &Path, message: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let mut text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
+    text.push_str(&timestamp_line(message));
+    text.push('\n');
+    std::fs::write(path, format!("{}\n", recent_logs(&text).join("\n")))
 }
 
 fn create_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -173,12 +200,19 @@ fn create_tray(app: &mut tauri::App) -> tauri::Result<()> {
 pub fn run() {
     let _ = logger::init();
     if let Err(error) = process::enable_debug_privilege() { append_log(&format!("无法启用调试权限：{}", error)); }
-    let config = config::load().unwrap_or_default();
+    let (config, config_error) = match config::load() {
+        Ok(config) => (config, None),
+        Err(error) => {
+            let message = error.to_string();
+            append_log(&format!("配置加载失败，已使用默认配置：{}", message));
+            (Config::default(), Some(message))
+        }
+    };
     let logical_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     monitor::spawn(config.clone(), logical_cpus, command_rx, event_tx);
-    let state = AppState { config: Mutex::new(config.clone()), monitor_tx: Mutex::new(command_tx), runtime: Mutex::new(RuntimeStatus { enabled: config.general.enabled, paused: false, logical_cpus, processor_group_supported: logical_cpus <= 64, permission_denied: false }) };
+    let state = AppState { config: Mutex::new(config.clone()), monitor_tx: Mutex::new(command_tx), runtime: Mutex::new(RuntimeStatus { enabled: config.general.enabled, paused: false, logical_cpus, processor_group_supported: logical_cpus <= 64, permission_denied: false, config_error }) };
     let builder = tauri::Builder::default().manage(state).invoke_handler(tauri::generate_handler![get_config, save_config, list_running_processes, get_rule_snapshots, get_logs, clear_logs, scan_now, apply_all, set_monitor_paused, set_start_with_windows, get_runtime_status, delete_process_rule]);
     builder.setup(move |app| {
         create_tray(app)?;
@@ -235,5 +269,32 @@ mod tests {
         let line = timestamp_line("应用成功");
         assert!(has_timestamp(&line));
         assert!(line.ends_with(" 应用成功"));
+    }
+
+    #[test]
+    fn recent_logs_keeps_latest_hundred_in_order() {
+        let text = (0..105).map(|i| format!("[12:34:56] 日志 {i}\n")).collect::<String>();
+        let lines = recent_logs(&text);
+        assert_eq!(lines.len(), 100);
+        assert_eq!(lines.first().unwrap(), "[12:34:56] 日志 5");
+        assert_eq!(lines.last().unwrap(), "[12:34:56] 日志 104");
+        assert!(recent_logs("").is_empty());
+        assert_eq!(recent_logs("[12:34:56] 一条日志").len(), 1);
+    }
+
+    #[test]
+    fn log_file_stays_bounded_after_append() {
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("affinity-log-test-{}-{suffix}", std::process::id())).join("app.log");
+        write_log(&path, "初次记录").unwrap();
+        let initial = (0..105).map(|i| format!("[12:34:56] 日志 {i}\n")).collect::<String>();
+        std::fs::write(&path, initial.trim_end()).unwrap();
+        write_log(&path, "最新记录").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 100);
+        assert_eq!(lines.first().unwrap(), &"[12:34:56] 日志 6");
+        assert!(lines.last().unwrap().ends_with(" 最新记录"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

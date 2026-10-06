@@ -1,0 +1,10 @@
+/build/bin/
+/frontend/node_modules/
+!/frontend/dist/
+/frontend/dist/*
+!/frontend/dist/.gitkeep
+*.syso
+*.exe
+*.test
+/.cache/
+/frontend/package.json.md5

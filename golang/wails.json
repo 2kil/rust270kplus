@@ -1,0 +1,15 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "ProcessAffinityManager",
+  "outputfilename": "process-affinity-manager-go",
+  "frontend:install": "pnpm install --frozen-lockfile",
+  "frontend:build": "pnpm run build",
+  "frontend:dev:watcher": "pnpm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "info": {
+    "companyName": "ProcessAffinityManager",
+    "productName": "进程亲和性管理器",
+    "productVersion": "0.2.0",
+    "comments": "Go + Wails 进程性能管理工具"
+  }
+}

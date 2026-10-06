@@ -32,14 +32,6 @@ pub fn cpu_list_mask(cpus: &[usize], logical_cpus: usize) -> Result<u64, String>
     Ok(mask)
 }
 
-pub fn format_mask(mask: Option<u64>, logical_cpus: usize) -> String {
-    match mask {
-        None => "不支持（多 Processor Group）".into(),
-        Some(value) => (0..logical_cpus).filter(|i| value & (1u64 << i) != 0)
-            .map(|i| format!("CPU {i}")).collect::<Vec<_>>().join(", "),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
