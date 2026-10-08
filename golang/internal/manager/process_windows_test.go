@@ -6,13 +6,57 @@ import (
 	"math/bits"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+func TestWindowsRuleFilteredEnumeration(t *testing.T) {
+	source := WindowsProcesses{}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The test process stays alive across enumerations, unlike unrelated processes.
+	name := strings.ToUpper(filepath.Base(exe))
+	rules := []ProcessRule{{Name: name, Enabled: true}}
+	check := func(wantPath bool) {
+		t.Helper()
+		items, err := source.ListForRules(rules)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, item := range items {
+			if !strings.EqualFold(item.Name, name) {
+				t.Fatal("返回无关进程", item.Name)
+			}
+			if item.PID == uint32(os.Getpid()) {
+				found = true
+				if item.StartTime == 0 || (item.Path != nil) != wantPath {
+					t.Fatal("筛选后元数据错误", item)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("未枚举到测试进程")
+		}
+	}
+	check(false)
+	rules = append(rules, ProcessRule{Name: name, Enabled: false, MatchMode: "specific_path"})
+	check(false)
+	rules[1].Enabled = true
+	check(true)
+	rules = nil
+	if items, err := source.ListForRules(rules); err != nil || len(items) != 0 {
+		t.Fatal(items, err)
+	}
+}
 
 func TestProcessHelper(t *testing.T) {
 	if os.Getenv("AFFINITY_TEST_HELPER") != "1" {

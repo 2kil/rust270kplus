@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +12,80 @@ type fakeProcesses struct {
 	failed bool
 	calls  atomic.Int32
 	listed atomic.Int32
+}
+
+func TestIndexedMonitorMatchesLinearRulesAndRebuilds(t *testing.T) {
+	path := `C:\Apps\demo.exe`
+	source := &fakeProcesses{items: []ProcessInfo{
+		{PID: 5, Name: "demo.exe", StartTime: 2, Path: &path},
+		{PID: 4, Name: "DEMO.EXE", StartTime: 1},
+		{PID: 3, Name: "K.exe", StartTime: 1},
+		{PID: 2, Name: "other.exe", StartTime: 1},
+	}}
+	config := ruleConfig()
+	for _, rule := range []ProcessRule{
+		{Name: "demo.exe", Enabled: true, MatchMode: "first_instance"},
+		{Name: "demo.exe", Enabled: true, MatchMode: "specific_path", Path: &path},
+		{Name: "k.exe", Enabled: true, MatchMode: "all_instances"},
+		{Name: "other.exe", Enabled: false},
+	} {
+		config.Processes = append(config.Processes, rule)
+	}
+	m := NewMonitor(config, 8, true, source, func(Event) {})
+	check := func() {
+		t.Helper()
+		m.scan(time.Now())
+		var want []RuleSnapshot
+		for i, rule := range config.Processes {
+			if !rule.Enabled {
+				continue
+			}
+			matches := MatchingProcesses(source.items, rule)
+			snapshot := RuleSnapshot{Index: i, Name: rule.Name, Running: len(matches) > 0, PIDs: []uint32{}}
+			for _, item := range matches {
+				snapshot.PIDs = append(snapshot.PIDs, item.PID)
+			}
+			want = append(want, snapshot)
+		}
+		if !reflect.DeepEqual(m.Snapshots(), want) {
+			t.Fatal("索引匹配与线性匹配不一致", m.Snapshots(), want)
+		}
+	}
+	check()
+	source.items = source.items[2:]
+	check()
+	config.Processes = []ProcessRule{{Name: "OTHER.EXE", Enabled: true}}
+	m.UpdateConfig(config)
+	check()
+	if len(m.processIndex) != 1 {
+		t.Fatal("旧规则索引未释放")
+	}
+}
+
+type filteredProcesses struct {
+	fakeProcesses
+	filteredCalls int
+}
+
+func (f *filteredProcesses) ListForRules([]ProcessRule) ([]ProcessInfo, error) {
+	f.filteredCalls++
+	return f.items, nil
+}
+
+func TestMonitorUsesRuleFilteredSource(t *testing.T) {
+	source := &filteredProcesses{}
+	config := ruleConfig()
+	m := NewMonitor(config, 8, true, source, func(Event) {})
+	m.scan(time.Now())
+	if source.filteredCalls != 1 || source.listed.Load() != 0 {
+		t.Fatal("未使用规则筛选枚举")
+	}
+	config.Processes[0].Enabled = false
+	m.UpdateConfig(config)
+	m.scan(time.Now())
+	if source.filteredCalls != 1 {
+		t.Fatal("没有启用的规则时仍枚举进程")
+	}
 }
 
 func (f *fakeProcesses) List() ([]ProcessInfo, error) { f.listed.Add(1); return f.items, nil }

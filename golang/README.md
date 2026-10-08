@@ -36,9 +36,11 @@ go test -tags "desktop,production,desktop_smoke" -run TestDesktopSmoke -timeout 
 
 ## 功能与兼容性
 
+性能基准、优化说明和 Windows 验证结果见 [PERFORMANCE.md](PERFORMANCE.md)。可用 `go test ./internal/manager -run '^$' -bench 'Benchmark' -benchmem -count 3` 复现基准。
+
 - 按进程名、首个实例或完整路径匹配；支持添加、编辑和删除规则。
 - CPU 亲和性支持全部 CPU、最后一个 CPU、指定 CPU 和保持原设置；提供六档进程优先级。
-- 后台自动扫描、立即应用、暂停与恢复；使用规则索引、PID 和启动时间缓存，失败后五秒重试，清理已退出进程的缓存。
+- 后台自动扫描、立即应用、暂停与恢复；按启用规则的名称筛选进程，按需查询路径，使用可复用的名称索引、PID 和启动时间缓存，失败后五秒重试，清理已退出进程的缓存。
 - 托盘菜单提供显示窗口、立即应用、暂停、恢复、切换开机启动和退出；关闭窗口可隐藏到托盘，保存窗口尺寸。
 - 添加页面保留亲和性与优先级的左右布局；运行日志和日志文件保留最近 100 条。
 

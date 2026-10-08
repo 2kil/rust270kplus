@@ -2,8 +2,8 @@ package manager
 
 import (
 	"fmt"
-	"slices"
 	"strings"
+	"unicode"
 )
 
 type ProcessInfo struct {
@@ -35,29 +35,33 @@ func MatchingProcesses(processes []ProcessInfo, rule ProcessRule) []ProcessInfo 
 		if rule.MatchMode == "specific_path" && (rule.Path == nil || item.Path == nil || !strings.EqualFold(*rule.Path, *item.Path)) {
 			continue
 		}
-		items = append(items, item)
-	}
-	if rule.MatchMode == "first_instance" {
-		slices.SortFunc(items, func(a, b ProcessInfo) int {
-			if a.StartTime < b.StartTime {
-				return -1
+		if rule.MatchMode == "first_instance" {
+			if len(items) == 0 {
+				items = append(items, item)
+			} else if item.StartTime < items[0].StartTime || (item.StartTime == items[0].StartTime && item.PID < items[0].PID) {
+				items[0] = item
 			}
-			if a.StartTime > b.StartTime {
-				return 1
-			}
-			if a.PID < b.PID {
-				return -1
-			}
-			if a.PID > b.PID {
-				return 1
-			}
-			return 0
-		})
-		if len(items) > 1 {
-			items = items[:1]
+		} else {
+			items = append(items, item)
 		}
 	}
 	return items
+}
+
+// Use the same Unicode simple-fold equivalence as strings.EqualFold.
+func processNameKey(name string) string {
+	return strings.Map(func(r rune) rune {
+		key := r
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next < key {
+				key = next
+			}
+		}
+		if key >= 'A' && key <= 'Z' {
+			return key + ('a' - 'A')
+		}
+		return key
+	}, name)
 }
 
 func AffinityMask(rule ProcessRule, cpuCount int) (uint64, error) {

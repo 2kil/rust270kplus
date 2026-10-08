@@ -11,6 +11,10 @@ type ProcessSource interface {
 	Apply(ProcessInfo, ProcessRule, int, bool) ApplyResult
 }
 
+type ruleProcessSource interface {
+	ListForRules([]ProcessRule) ([]ProcessInfo, error)
+}
+
 type Event struct {
 	Type string `json:"type"`
 	Data any    `json:"data"`
@@ -43,21 +47,37 @@ type processKey struct {
 }
 
 type Monitor struct {
-	mu         sync.RWMutex
-	config     Config
-	status     RuntimeStatus
-	snapshots  []RuleSnapshot
-	source     ProcessSource
-	emit       func(Event)
-	cache      map[processKey]bool
-	retryAfter map[processKey]time.Time
-	wake       chan struct{}
-	stop       chan struct{}
-	done       chan struct{}
+	mu           sync.RWMutex
+	config       Config
+	status       RuntimeStatus
+	snapshots    []RuleSnapshot
+	source       ProcessSource
+	emit         func(Event)
+	cache        map[processKey]bool
+	retryAfter   map[processKey]time.Time
+	processIndex map[string][]ProcessInfo
+	ruleKeys     []string
+	wake         chan struct{}
+	stop         chan struct{}
+	done         chan struct{}
 }
 
 func NewMonitor(config Config, cpuCount int, singleGroup bool, source ProcessSource, emit func(Event)) *Monitor {
-	return &Monitor{config: CloneConfig(config), status: RuntimeStatus{Enabled: config.General.Enabled, LogicalCPUs: cpuCount, ProcessorGroupSupported: singleGroup}, snapshots: []RuleSnapshot{}, source: source, emit: emit, cache: map[processKey]bool{}, retryAfter: map[processKey]time.Time{}, wake: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
+	m := &Monitor{config: CloneConfig(config), status: RuntimeStatus{Enabled: config.General.Enabled, LogicalCPUs: cpuCount, ProcessorGroupSupported: singleGroup}, snapshots: []RuleSnapshot{}, source: source, emit: emit, cache: map[processKey]bool{}, retryAfter: map[processKey]time.Time{}, wake: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
+	m.rebuildProcessIndex()
+	return m
+}
+
+func (m *Monitor) rebuildProcessIndex() {
+	m.processIndex = make(map[string][]ProcessInfo)
+	m.ruleKeys = make([]string, len(m.config.Processes))
+	for i, rule := range m.config.Processes {
+		if rule.Enabled {
+			key := processNameKey(rule.Name)
+			m.ruleKeys[i] = key
+			m.processIndex[key] = nil
+		}
+	}
 }
 
 func (m *Monitor) Start() { go m.run() }
@@ -88,12 +108,27 @@ func (m *Monitor) scan(now time.Time) {
 	for _, rule := range m.config.Processes {
 		if rule.Enabled {
 			var err error
-			items, err = m.source.List()
+			if source, ok := m.source.(ruleProcessSource); ok {
+				items, err = source.ListForRules(m.config.Processes)
+			} else {
+				items, err = m.source.List()
+			}
 			if err != nil {
 				m.emit(Event{Type: "Status", Data: StatusEvent{Message: "读取进程失败：" + err.Error(), Paused: m.status.Paused}})
 				return
 			}
 			break
+		}
+	}
+	byName := m.processIndex
+	for key, bucket := range byName {
+		clear(bucket)
+		byName[key] = bucket[:0]
+	}
+	for _, item := range items {
+		key := processNameKey(item.Name)
+		if bucket, matched := byName[key]; matched {
+			byName[key] = append(bucket, item)
 		}
 	}
 	snapshots := []RuleSnapshot{}
@@ -102,7 +137,10 @@ func (m *Monitor) scan(now time.Time) {
 		if !rule.Enabled {
 			continue
 		}
-		matches := MatchingProcesses(items, rule)
+		matches := byName[m.ruleKeys[index]]
+		if rule.MatchMode == "first_instance" || rule.MatchMode == "specific_path" {
+			matches = MatchingProcesses(matches, rule)
+		}
 		snapshot := RuleSnapshot{Index: index, Name: rule.Name, Running: len(matches) > 0, PIDs: []uint32{}}
 		for _, item := range matches {
 			snapshot.PIDs = append(snapshot.PIDs, item.PID)
@@ -153,6 +191,7 @@ func (m *Monitor) signal() {
 func (m *Monitor) UpdateConfig(config Config) {
 	m.mu.Lock()
 	m.config = CloneConfig(config)
+	m.rebuildProcessIndex()
 	m.status.Enabled = config.General.Enabled
 	m.cache = map[processKey]bool{}
 	m.retryAfter = map[processKey]time.Time{}

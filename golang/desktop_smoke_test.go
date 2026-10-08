@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
+
+	winapi "golang.org/x/sys/windows"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -22,6 +25,14 @@ import (
 )
 
 func TestDesktopSmoke(t *testing.T) {
+	// Go tests run on a separate goroutine from package initialization. WebView2
+	// needs its window and COM apartment to stay on the same OS thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := winapi.CoInitializeEx(0, winapi.COINIT_APARTMENTTHREADED); err != nil {
+		t.Fatal(err)
+	}
+	defer winapi.CoUninitialize()
 	base := t.TempDir()
 	config := manager.DefaultConfig()
 	config.General.Enabled = false

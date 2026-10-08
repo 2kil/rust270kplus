@@ -26,6 +26,26 @@ func ProcessorInfo() (int, bool) {
 }
 
 func (WindowsProcesses) List() ([]ProcessInfo, error) {
+	return listWindowsProcesses(nil)
+}
+
+// Background scans only query handles for enabled rule names; the UI still
+// receives full metadata through List. Paths are queried only for path rules.
+func (WindowsProcesses) ListForRules(rules []ProcessRule) ([]ProcessInfo, error) {
+	names := make(map[string]bool)
+	for _, rule := range rules {
+		if rule.Enabled {
+			key := processNameKey(rule.Name)
+			names[key] = names[key] || rule.MatchMode == "specific_path"
+		}
+	}
+	if len(names) == 0 {
+		return []ProcessInfo{}, nil
+	}
+	return listWindowsProcesses(names)
+}
+
+func listWindowsProcesses(names map[string]bool) ([]ProcessInfo, error) {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil, err
@@ -36,15 +56,25 @@ func (WindowsProcesses) List() ([]ProcessInfo, error) {
 	buffer := make([]uint16, 32768)
 	for err = windows.Process32First(snapshot, &entry); err == nil; err = windows.Process32Next(snapshot, &entry) {
 		item := ProcessInfo{PID: entry.ProcessID, Name: windows.UTF16ToString(entry.ExeFile[:])}
+		queryPath := true
+		if names != nil {
+			var matched bool
+			queryPath, matched = names[processNameKey(item.Name)]
+			if !matched {
+				continue
+			}
+		}
 		if handle, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, item.PID); openErr == nil {
 			var created, exited, kernel, user windows.Filetime
 			if windows.GetProcessTimes(handle, &created, &exited, &kernel, &user) == nil {
 				item.StartTime = uint64(created.HighDateTime)<<32 | uint64(created.LowDateTime)
 			}
-			size := uint32(len(buffer))
-			if windows.QueryFullProcessImageName(handle, 0, &buffer[0], &size) == nil {
-				value := windows.UTF16ToString(buffer[:size])
-				item.Path = &value
+			if queryPath {
+				size := uint32(len(buffer))
+				if windows.QueryFullProcessImageName(handle, 0, &buffer[0], &size) == nil {
+					value := windows.UTF16ToString(buffer[:size])
+					item.Path = &value
+				}
 			}
 			windows.CloseHandle(handle)
 		}
